@@ -183,7 +183,8 @@ def list_s3_parquet_files(date_folder: str) -> List[str]:
 def get_s3_data(date_folder, file_name):
     """Fetch data from S3 and return as JSON"""
     try:
-        key = f"{date_folder}/{file_name}"
+        key = f"{S3_PREFIX}/{date_folder}/{file_name}"
+        logger.info(f"Fetching S3 object: {key}")
         response = s3_client.get_object(Bucket=S3_BUCKET_NAME, Key=key)
         df = pd.read_parquet(response['Body'])
         return df.to_json(orient='records')
