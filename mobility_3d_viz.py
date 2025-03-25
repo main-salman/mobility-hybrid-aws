@@ -22,15 +22,11 @@ import json
 load_dotenv('.env.local')
 
 # AWS S3 Configuration
-S3_BUCKET_URL = os.getenv('S3_BUCKET')
+S3_BUCKET_NAME = os.getenv('S3_BUCKET')
+S3_PREFIX = os.getenv('S3_PREFIX', '')
 AWS_ACCESS_KEY_ID = os.getenv('AWS_ACCESS_KEY_ID')
 AWS_SECRET_ACCESS_KEY = os.getenv('AWS_SECRET_ACCESS_KEY')
 AWS_DEFAULT_REGION = os.getenv('AWS_DEFAULT_REGION')
-
-# Parse bucket name and prefix
-bucket_parts = S3_BUCKET_URL.split('/')
-S3_BUCKET_NAME = bucket_parts[0]
-S3_PREFIX = '/'.join(bucket_parts[1:]) if len(bucket_parts) > 1 else ''
 
 # Initialize S3 client
 s3_client = boto3.client(
