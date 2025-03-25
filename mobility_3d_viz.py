@@ -195,9 +195,9 @@ def get_s3_data(date_folder, file_name):
         return None
 
 # Add API endpoint
-if st.experimental_get_query_params().get('api') == ['s3_data']:
-    date_folder = st.experimental_get_query_params().get('date', [''])[0]
-    file_name = st.experimental_get_query_params().get('file', [''])[0]
+if st.query_params.get('api') == ['s3_data']:
+    date_folder = st.query_params.get('date', [''])[0]
+    file_name = st.query_params.get('file', [''])[0]
     
     if date_folder and file_name:
         data = get_s3_data(date_folder, file_name)
@@ -393,6 +393,127 @@ def create_heatmap_by_hour(df: pd.DataFrame) -> pd.DataFrame:
         return pd.DataFrame()
         
     return pd.concat(hour_groups)
+
+@st.cache_data(ttl=CACHE_TTL)
+def get_available_date_range() -> Tuple[datetime, datetime]:
+    """Get available date range from S3 folder names"""
+    try:
+        date_folders = list_s3_date_folders()
+        
+        if not date_folders:
+            logger.error("No date folders found in S3")
+            return datetime.now(), datetime.now()
+        
+        dates = []
+        for folder in date_folders:
+            try:
+                date_str = folder.split('=')[1]
+                date = datetime.strptime(date_str, '%Y-%m-%d')
+                dates.append(date)
+            except Exception as e:
+                logger.error(f"Error parsing date from folder {folder}: {e}")
+                continue
+        
+        if not dates:
+            logger.error("No valid dates found")
+            return datetime.now(), datetime.now()
+        
+        min_date = min(dates)
+        max_date = max(dates)
+        logger.info(f"Available date range: {min_date.date()} to {max_date.date()}")
+        
+        return min_date, max_date
+    except Exception as e:
+        logger.error(f"Error getting date range: {e}")
+        return datetime.now(), datetime.now()
+
+@st.cache_data(ttl=CACHE_TTL)
+def load_data_for_range(start_date: datetime, end_date: datetime) -> pd.DataFrame:
+    """Load data from S3 for specific date range"""
+    try:
+        logger.info(f"Loading data for date range: {start_date.date()} to {end_date.date()}")
+        
+        # Get list of date folders from S3
+        date_folders = list_s3_date_folders()
+        
+        # Filter folders by date range
+        filtered_folders = []
+        for folder in date_folders:
+            folder_date = get_date_from_folder(folder)
+            if start_date.date() <= folder_date.date() <= end_date.date():
+                filtered_folders.append(folder)
+        
+        if not filtered_folders:
+            logger.warning(f"No date folders found in range: {start_date.date()} to {end_date.date()}")
+            return pd.DataFrame()
+        
+        logger.info(f"Found {len(filtered_folders)} date folders in range")
+        
+        # Process each date folder
+        dfs = []
+        for date_folder in filtered_folders:
+            logger.info(f"Processing folder: {date_folder}")
+            
+            # Get list of parquet files in the folder
+            parquet_files = list_s3_parquet_files(date_folder)
+            
+            # Sample files if there are too many
+            if len(parquet_files) > MAX_FILES_PER_DATE:
+                parquet_files = np.random.choice(parquet_files, MAX_FILES_PER_DATE, replace=False)
+            
+            logger.info(f"Processing {len(parquet_files)} files from {date_folder}")
+            
+            # Process each file
+            for s3_key in parquet_files:
+                try:
+                    # Read parquet file from S3
+                    response = s3_client.get_object(Bucket=S3_BUCKET_NAME, Key=s3_key)
+                    parquet_buffer = io.BytesIO(response['Body'].read())
+                    
+                    # Read the file with sampling
+                    table = pq.read_table(
+                        parquet_buffer,
+                        columns=['utc_timestamp', 'latitude', 'longitude', 'ad_id']
+                    )
+                    
+                    # Convert to pandas and sample
+                    file_df = table.to_pandas()
+                    sampled_df = file_df.sample(frac=SAMPLE_RATE)
+                    
+                    # Add date from folder name
+                    folder_date = date_folder.split('=')[1]
+                    sampled_df['folder_date'] = folder_date
+                    
+                    dfs.append(sampled_df)
+                    
+                except Exception as e:
+                    logger.error(f"Error processing file {s3_key}: {e}")
+                    continue
+        
+        # Combine all dataframes
+        if not dfs:
+            logger.error("No data loaded from any folder")
+            return pd.DataFrame()
+        
+        df = pd.concat(dfs, ignore_index=True)
+        logger.info(f"Loaded {len(df)} sampled records")
+        
+        # Convert columns
+        df['timestamp'] = pd.to_datetime(df['utc_timestamp'])
+        df['hour'] = df['timestamp'].dt.hour
+        
+        # Convert lat/long to float
+        df['latitude'] = pd.to_numeric(df['latitude'], errors='coerce')
+        df['longitude'] = pd.to_numeric(df['longitude'], errors='coerce')
+        
+        # Drop rows with invalid lat/long
+        df = df.dropna(subset=['latitude', 'longitude'])
+        logger.info(f"After cleaning: {len(df)} valid records")
+        
+        return df
+    except Exception as e:
+        logger.error(f"Error loading data: {e}")
+        return pd.DataFrame()
 
 def main():
     # Header section with minimalist design
