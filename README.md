@@ -10,6 +10,7 @@ This project aims to provide an efficient and interactive way to visualize large
 - Implementing efficient data loading and caching strategies
 - Providing multiple visualization types for different analysis needs
 - Supporting interactive data exploration and filtering
+- Enabling client-side data loading for better monitoring and debugging
 
 ## Features
 
@@ -32,6 +33,13 @@ This project aims to provide an efficient and interactive way to visualize large
 - Smart data aggregation
 - Caching mechanisms
 - Optimized rendering for large datasets
+- Client-side data loading for better monitoring
+
+### Monitoring and Debugging
+- Network request monitoring in browser console
+- S3 data transfer visibility
+- Real-time data loading status
+- Error tracking and reporting
 
 ## Technical Stack
 
@@ -41,6 +49,7 @@ This project aims to provide an efficient and interactive way to visualize large
 - **Storage**: AWS S3
 - **Data Format**: Parquet
 - **Python Version**: 3.8+
+- **API**: RESTful endpoints for data access
 
 ## Setup Instructions
 
@@ -75,6 +84,26 @@ This project aims to provide an efficient and interactive way to visualize large
    ```bash
    streamlit run mobility_3d_viz.py
    ```
+
+## Monitoring Data Loading
+
+The application now supports client-side data loading, which means you can monitor S3 data transfers in your browser's Network console:
+
+1. Open your browser's Developer Tools (F12 or right-click -> Inspect)
+2. Go to the Network tab
+3. Filter by "Fetch/XHR" requests
+4. Look for requests to the `/api/s3_data` endpoint
+5. You can see:
+   - Request/response headers
+   - Data transfer size
+   - Loading time
+   - Response data
+
+This helps in:
+- Monitoring data transfer performance
+- Debugging loading issues
+- Understanding data flow
+- Optimizing data loading patterns
 
 ## Data Structure
 
