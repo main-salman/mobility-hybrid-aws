@@ -27,10 +27,10 @@ AWS_ACCESS_KEY_ID = os.getenv('AWS_ACCESS_KEY_ID')
 AWS_SECRET_ACCESS_KEY = os.getenv('AWS_SECRET_ACCESS_KEY')
 AWS_DEFAULT_REGION = os.getenv('AWS_DEFAULT_REGION')
 
-# Parse S3 bucket name and prefix
-parsed_url = urlparse(S3_BUCKET_URL)
-S3_BUCKET_NAME = parsed_url.netloc
-S3_PREFIX = parsed_url.path.strip('/')
+# Parse bucket name and prefix
+bucket_parts = S3_BUCKET_URL.split('/')
+S3_BUCKET_NAME = bucket_parts[0]
+S3_PREFIX = '/'.join(bucket_parts[1:]) if len(bucket_parts) > 1 else ''
 
 # Initialize S3 client
 s3_client = boto3.client(
@@ -150,10 +150,11 @@ def list_s3_date_folders() -> List[str]:
         for page in result:
             if "CommonPrefixes" in page:
                 for prefix in page["CommonPrefixes"]:
-                    folder = prefix["Prefix"].split('/')[-2]  # Get the last folder name
+                    folder = prefix["Prefix"].rstrip('/').split('/')[-1]  # Get the last folder name
                     if folder.startswith('date='):
                         date_folders.append(folder)
         
+        logger.info(f"Found date folders: {date_folders}")
         return sorted(date_folders)
     except Exception as e:
         logger.error(f"Error listing S3 folders: {e}")
@@ -428,10 +429,35 @@ def get_available_date_range() -> Tuple[datetime, datetime]:
         return datetime.now(), datetime.now()
 
 @st.cache_data(ttl=CACHE_TTL)
+def get_s3_presigned_url(key: str) -> str:
+    """Generate a presigned URL for an S3 object"""
+    try:
+        url = s3_client.generate_presigned_url(
+            'get_object',
+            Params={'Bucket': S3_BUCKET_NAME, 'Key': key},
+            ExpiresIn=3600  # URL valid for 1 hour
+        )
+        return url
+    except Exception as e:
+        logger.error(f"Error generating presigned URL for {key}: {e}")
+        return None
+
+def format_size(size_bytes):
+    """Format bytes into human readable format"""
+    for unit in ['B', 'KB', 'MB', 'GB']:
+        if size_bytes < 1024:
+            return f"{size_bytes:.1f} {unit}"
+        size_bytes /= 1024
+    return f"{size_bytes:.1f} TB"
+
 def load_data_for_range(start_date: datetime, end_date: datetime) -> pd.DataFrame:
     """Load data from S3 for specific date range"""
     try:
         logger.info(f"Loading data for date range: {start_date.date()} to {end_date.date()}")
+        
+        total_bytes_transferred = 0
+        total_files_processed = 0
+        total_files_failed = 0
         
         # Get list of date folders from S3
         date_folders = list_s3_date_folders()
@@ -449,54 +475,62 @@ def load_data_for_range(start_date: datetime, end_date: datetime) -> pd.DataFram
         
         logger.info(f"Found {len(filtered_folders)} date folders in range")
         
-        # Process each date folder
+        # For now, still load data server-side until we implement full client-side processing
         dfs = []
         for date_folder in filtered_folders:
-            logger.info(f"Processing folder: {date_folder}")
-            
-            # Get list of parquet files in the folder
             parquet_files = list_s3_parquet_files(date_folder)
+            logger.info(f"Found {len(parquet_files)} files in {date_folder}")
             
             # Sample files if there are too many
             if len(parquet_files) > MAX_FILES_PER_DATE:
                 parquet_files = np.random.choice(parquet_files, MAX_FILES_PER_DATE, replace=False)
             
-            logger.info(f"Processing {len(parquet_files)} files from {date_folder}")
-            
-            # Process each file
             for s3_key in parquet_files:
                 try:
-                    # Read parquet file from S3
-                    response = s3_client.get_object(Bucket=S3_BUCKET_NAME, Key=s3_key)
+                    s3_key = f"{S3_PREFIX}/{date_folder}/{os.path.basename(s3_key)}"
+                    logger.info(f"Loading file: {s3_key}")
+                    
+                    response = s3_client.get_object(
+                        Bucket=S3_BUCKET_NAME,
+                        Key=s3_key
+                    )
+                    
+                    # Get file size from response
+                    file_size = response['ContentLength']
+                    total_bytes_transferred += file_size
+                    total_files_processed += 1
+                    
                     parquet_buffer = io.BytesIO(response['Body'].read())
                     
-                    # Read the file with sampling
                     table = pq.read_table(
                         parquet_buffer,
                         columns=['utc_timestamp', 'latitude', 'longitude', 'ad_id']
                     )
                     
-                    # Convert to pandas and sample
                     file_df = table.to_pandas()
                     sampled_df = file_df.sample(frac=SAMPLE_RATE)
-                    
-                    # Add date from folder name
-                    folder_date = date_folder.split('=')[1]
-                    sampled_df['folder_date'] = folder_date
-                    
+                    sampled_df['folder_date'] = date_folder.split('=')[1]
                     dfs.append(sampled_df)
                     
                 except Exception as e:
                     logger.error(f"Error processing file {s3_key}: {e}")
+                    total_files_failed += 1
                     continue
         
-        # Combine all dataframes
         if not dfs:
             logger.error("No data loaded from any folder")
             return pd.DataFrame()
         
         df = pd.concat(dfs, ignore_index=True)
         logger.info(f"Loaded {len(df)} sampled records")
+        
+        # Store transfer metrics in session state
+        st.session_state['data_transfer_metrics'] = {
+            'total_bytes': total_bytes_transferred,
+            'files_processed': total_files_processed,
+            'files_failed': total_files_failed,
+            'formatted_size': format_size(total_bytes_transferred)
+        }
         
         # Convert columns
         df['timestamp'] = pd.to_datetime(df['utc_timestamp'])
@@ -511,6 +545,7 @@ def load_data_for_range(start_date: datetime, end_date: datetime) -> pd.DataFram
         logger.info(f"After cleaning: {len(df)} valid records")
         
         return df
+        
     except Exception as e:
         logger.error(f"Error loading data: {e}")
         return pd.DataFrame()
@@ -644,6 +679,28 @@ def main():
     if df.empty:
         st.warning("No data available for the selected time range")
         return
+    
+    # Display data transfer metrics in a modern card
+    if 'data_transfer_metrics' in st.session_state:
+        metrics = st.session_state['data_transfer_metrics']
+        st.markdown("""
+        <div style='background-color: white; padding: 1.5rem; border-radius: 15px; 
+        box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06);
+        margin-bottom: 2rem;'>
+            <h4 style='color: #1D1D1F; margin-bottom: 1rem;'>Data Transfer Summary</h4>
+        </div>
+        """, unsafe_allow_html=True)
+        
+        metric_cols = st.columns(4)
+        with metric_cols[0]:
+            st.metric("Data Downloaded", metrics['formatted_size'])
+        with metric_cols[1]:
+            st.metric("Files Processed", str(metrics['files_processed']))
+        with metric_cols[2]:
+            st.metric("Files Failed", str(metrics['files_failed']))
+        with metric_cols[3]:
+            success_rate = (metrics['files_processed'] - metrics['files_failed']) / metrics['files_processed'] * 100 if metrics['files_processed'] > 0 else 0
+            st.metric("Success Rate", f"{success_rate:.1f}%")
     
     # Apply hour filter
     df = df[(df['hour'] >= hour_filter[0]) & (df['hour'] < hour_filter[1])]
