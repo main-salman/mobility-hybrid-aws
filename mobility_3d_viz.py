@@ -49,6 +49,33 @@ DEFAULT_ZOOM = 11
 CACHE_TTL = 3600  # 1 hour in seconds
 SAMPLE_RATE = 0.01  # Sample 1% of data from each file
 MAX_FILES_PER_DATE = 5  # Max number of files to process per date folder
+GOOGLE_MAPS_API_KEY = os.getenv('NEXT_PUBLIC_GOOGLE_MAPS_API_KEY')
+
+# Map style configuration
+MAP_STYLE = "mapbox://styles/mapbox/light-v9"  # Use a light style base map
+
+# Custom JavaScript for Google Maps integration
+GOOGLE_MAPS_SCRIPT = """
+<script src="https://maps.googleapis.com/maps/api/js?key=%s"></script>
+<script>
+window.addEventListener('load', function() {
+    const mapboxContainer = document.querySelector('.mapboxgl-map');
+    if (!mapboxContainer) return;
+    
+    const googleMap = new google.maps.Map(mapboxContainer, {
+        center: {lat: %f, lng: %f},
+        zoom: %d,
+        styles: [
+            {
+                featureType: "all",
+                elementType: "labels",
+                stylers: [{ visibility: "off" }]
+            }
+        ]
+    });
+});
+</script>
+""" % (GOOGLE_MAPS_API_KEY, DEFAULT_CENTER[0], DEFAULT_CENTER[1], DEFAULT_ZOOM)
 
 # Set page config
 st.set_page_config(
@@ -171,9 +198,10 @@ def list_s3_parquet_files(date_folder: str) -> List[str]:
         for page in result:
             if "Contents" in page:
                 for obj in page["Contents"]:
-                    if obj["Key"].endswith('.parquet'):
+                    if obj["Key"].endswith('.snappy.parquet'):  # Only get .snappy.parquet files
                         parquet_files.append(obj["Key"])
         
+        logger.info(f"Found {len(parquet_files)} parquet files in {date_folder}")
         return parquet_files
     except Exception as e:
         logger.error(f"Error listing S3 files in {date_folder}: {e}")
@@ -221,56 +249,44 @@ def get_time_period_hours(period: str) -> Tuple[int, int]:
     }
     return periods.get(period, (0, 24))
 
-def create_trajectories(df: pd.DataFrame, max_trajectories: int = 500) -> pd.DataFrame:
-    """Create trajectories based on user IDs and timestamps"""
-    # Group by ad_id and sort by timestamp
+def create_trajectories(df: pd.DataFrame, max_trajectories: int = 100) -> pd.DataFrame:
+    """Create trajectories based on aggregated data"""
+    # Group by hour and location to create flows
     trajectory_dfs = []
     
-    # Get unique ad_ids
-    unique_ids = df['ad_id'].unique()
+    # Get unique locations
+    unique_locations = df[['latitude', 'longitude']].drop_duplicates()
     
     # Sample if too many
-    if len(unique_ids) > max_trajectories:
-        unique_ids = np.random.choice(unique_ids, max_trajectories, replace=False)
+    if len(unique_locations) > max_trajectories:
+        unique_locations = unique_locations.sample(n=max_trajectories)
     
-    # Process each user
-    for user_id in unique_ids:
-        user_df = df[df['ad_id'] == user_id].sort_values('timestamp')
+    # Process each location
+    for _, loc in unique_locations.iterrows():
+        loc_df = df[
+            (df['latitude'] == loc['latitude']) & 
+            (df['longitude'] == loc['longitude'])
+        ].sort_values('hour')
         
-        # Need at least 2 points for a trajectory
-        if len(user_df) < 2:
+        # Need at least 2 hours for a trajectory
+        if len(loc_df) < 2:
             continue
             
-        # Create trajectories for this user
-        for i in range(len(user_df) - 1):
-            start_point = user_df.iloc[i]
-            end_point = user_df.iloc[i+1]
+        # Create trajectories between consecutive hours
+        for i in range(len(loc_df) - 1):
+            start_point = loc_df.iloc[i]
+            end_point = loc_df.iloc[i+1]
             
-            # Skip if points are too far in time (more than 6 hours)
-            time_diff = (end_point['timestamp'] - start_point['timestamp']).total_seconds()
-            if time_diff > 6 * 3600:
-                continue
-                
-            # Calculate distance
-            lat_diff = end_point['latitude'] - start_point['latitude']
-            lon_diff = end_point['longitude'] - start_point['longitude']
-            dist = np.sqrt(lat_diff**2 + lon_diff**2)
-            
-            # Skip if distance is too small or too large
-            if dist < 0.001 or dist > 0.5:  # About 100m to 50km
-                continue
-                
             # Create trajectory
             trajectory = {
                 'start_lat': start_point['latitude'],
                 'start_lon': start_point['longitude'],
                 'end_lat': end_point['latitude'],
                 'end_lon': end_point['longitude'],
-                'start_time': start_point['timestamp'],
-                'end_time': end_point['timestamp'],
-                'user_id': user_id,
-                'hour': start_point['hour'],
-                'dist': dist
+                'start_time': start_point['hour'],
+                'end_time': end_point['hour'],
+                'count': min(start_point['count'], end_point['count']),
+                'hour': start_point['hour']
             }
             trajectory_dfs.append(pd.DataFrame([trajectory]))
     
@@ -280,18 +296,19 @@ def create_trajectories(df: pd.DataFrame, max_trajectories: int = 500) -> pd.Dat
     trajectories = pd.concat(trajectory_dfs, ignore_index=True)
     logger.info(f"Created {len(trajectories)} trajectories")
     
-    # Normalize distances for color
+    # Normalize counts for color
     if not trajectories.empty:
-        trajectories['dist_norm'] = trajectories['dist'] / trajectories['dist'].max()
+        trajectories['count_norm'] = trajectories['count'] / trajectories['count'].max()
     
     return trajectories
 
 def create_hexmap_layer(df: pd.DataFrame) -> pdk.Layer:
-    """Create 3D hexagon map layer"""
+    """Create 3D hexagon map layer with aggregated data"""
     return pdk.Layer(
         "HexagonLayer",
         data=df,
         get_position=["longitude", "latitude"],
+        get_weight="count",  # Use count for weight
         radius=100,
         elevation_scale=10,
         elevation_range=[0, 1000],
@@ -302,7 +319,7 @@ def create_hexmap_layer(df: pd.DataFrame) -> pdk.Layer:
     )
 
 def create_arc_layer(trajectories: pd.DataFrame) -> pdk.Layer:
-    """Create arc layer for mobility flows"""
+    """Create arc layer for mobility flows with aggregated data"""
     return pdk.Layer(
         "ArcLayer",
         data=trajectories,
@@ -310,7 +327,7 @@ def create_arc_layer(trajectories: pd.DataFrame) -> pdk.Layer:
         get_target_position=["end_lon", "end_lat"],
         get_source_color=[255, 0, 0, 180],
         get_target_color=[0, 0, 255, 180],
-        get_width="dist * 500",  # Scale based on distance
+        get_width="count * 2",  # Scale width by count
         get_tilt=15,
         get_height=0.25,
         pickable=True,
@@ -333,11 +350,12 @@ def create_flow_map(trajectories: pd.DataFrame) -> pdk.Layer:
     )
 
 def create_grid_layer(df: pd.DataFrame) -> pdk.Layer:
-    """Create 3D grid layer for density visualization"""
+    """Create 3D grid layer with aggregated data"""
     return pdk.Layer(
         "GridLayer",
         data=df,
         get_position=["longitude", "latitude"],
+        get_weight="count",  # Use count for weight
         cell_size=100,
         elevation_scale=4,
         pickable=True,
@@ -345,13 +363,13 @@ def create_grid_layer(df: pd.DataFrame) -> pdk.Layer:
     )
 
 def create_scatterplot_layer(df: pd.DataFrame) -> pdk.Layer:
-    """Create 3D scatterplot layer for point visualization"""
+    """Create 3D scatterplot layer with aggregated data"""
     return pdk.Layer(
         "ScatterplotLayer",
         data=df,
         get_position=["longitude", "latitude"],
-        get_color=[255, 0, 0, 160],
-        get_radius=50,
+        get_fill_color=[255, 0, 0, 160],
+        get_radius="count * 50",  # Scale radius by count
         pickable=True,
     )
 
@@ -367,7 +385,7 @@ def prepare_flow_data(trajectories: pd.DataFrame) -> pd.DataFrame:
         rec = {
             'path': [[traj['start_lon'], traj['start_lat']], [traj['end_lon'], traj['end_lat']]],
             'timestamps': [0, 1],  # Start and end timestamps (normalized)
-            'color': [255, int(255 * (1 - traj['dist_norm'])), 0]
+            'color': [255, int(255 * (1 - traj['count_norm'])), 0]
         }
         trajectory_records.append(rec)
     
@@ -447,14 +465,62 @@ def format_size(size_bytes):
         size_bytes /= 1024
     return f"{size_bytes:.1f} TB"
 
-def load_data_for_range(start_date: datetime, end_date: datetime) -> pd.DataFrame:
-    """Load data from S3 for specific date range"""
+def get_viewport_bounds(deck: pdk.Deck) -> Tuple[float, float, float, float]:
+    """Get the current viewport bounds from the deck"""
+    view_state = deck.initial_view_state
+    lat = view_state.latitude
+    lon = view_state.longitude
+    zoom = view_state.zoom
+    
+    # Calculate bounds based on zoom level with more granular control
+    if zoom < 8:
+        lat_delta = 1.0  # ~100km for very zoomed out
+        lon_delta = 1.0
+    elif zoom < 10:
+        lat_delta = 0.5  # ~50km for zoomed out
+        lon_delta = 0.5
+    elif zoom < 12:
+        lat_delta = 0.2  # ~20km for medium zoom
+        lon_delta = 0.2
+    elif zoom < 14:
+        lat_delta = 0.1  # ~10km for zoomed in
+        lon_delta = 0.1
+    else:
+        lat_delta = 0.05  # ~5km for very zoomed in
+        lon_delta = 0.05
+    
+    # Ensure we're covering the Toronto area with more generous bounds
+    min_lat = max(43.0, lat - lat_delta)
+    max_lat = min(44.0, lat + lat_delta)
+    min_lon = max(-80.0, lon - lon_delta)
+    max_lon = min(-79.0, lon + lon_delta)
+    
+    return (min_lat, max_lat, min_lon, max_lon)
+
+def get_resolution_for_zoom(zoom: float) -> float:
+    """Get appropriate resolution based on zoom level"""
+    if zoom < 8:
+        return 0.1  # ~10km resolution for very zoomed out
+    elif zoom < 10:
+        return 0.05  # ~5km resolution for zoomed out
+    elif zoom < 12:
+        return 0.02  # ~2km resolution for medium zoom
+    elif zoom < 14:
+        return 0.01  # ~1km resolution for zoomed in
+    else:
+        return 0.005  # ~500m resolution for very zoomed in
+
+@st.cache_data(ttl=CACHE_TTL)
+def load_data_for_date_range(start_date: datetime, end_date: datetime) -> pd.DataFrame:
+    """Load data for entire date range - simplified approach"""
     try:
         logger.info(f"Loading data for date range: {start_date.date()} to {end_date.date()}")
         
+        # Initialize metrics
         total_bytes_transferred = 0
         total_files_processed = 0
         total_files_failed = 0
+        start_time = time.time()
         
         # Get list of date folders from S3
         date_folders = list_s3_date_folders()
@@ -470,44 +536,78 @@ def load_data_for_range(start_date: datetime, end_date: datetime) -> pd.DataFram
             logger.warning(f"No date folders found in range: {start_date.date()} to {end_date.date()}")
             return pd.DataFrame()
         
-        logger.info(f"Found {len(filtered_folders)} date folders in range")
-        
-        # For now, still load data server-side until we implement full client-side processing
+        # Load data from each folder
         dfs = []
+        
         for date_folder in filtered_folders:
             parquet_files = list_s3_parquet_files(date_folder)
-            logger.info(f"Found {len(parquet_files)} files in {date_folder}")
             
-            # Sample files if there are too many
-            if len(parquet_files) > MAX_FILES_PER_DATE:
-                parquet_files = np.random.choice(parquet_files, MAX_FILES_PER_DATE, replace=False)
-            
+            # Sort files by size (largest first) to prioritize files with more data
+            file_sizes = []
             for s3_key in parquet_files:
                 try:
-                    s3_key = f"{S3_PREFIX}/{date_folder}/{os.path.basename(s3_key)}"
-                    logger.info(f"Loading file: {s3_key}")
+                    response = s3_client.head_object(
+                        Bucket=S3_BUCKET_NAME,
+                        Key=s3_key
+                    )
+                    file_sizes.append((s3_key, response['ContentLength']))
+                except Exception as e:
+                    logger.error(f"Error getting file size for {s3_key}: {e}")
+                    continue
+            
+            # Sort by size, largest first
+            file_sizes.sort(key=lambda x: x[1], reverse=True)
+            
+            # Process up to 5 largest files per date
+            for s3_key, file_size in file_sizes[:5]:
+                try:
+                    logger.info(f"Processing file: {s3_key} (size: {format_size(file_size)})")
                     
                     response = s3_client.get_object(
                         Bucket=S3_BUCKET_NAME,
                         Key=s3_key
                     )
                     
-                    # Get file size from response
-                    file_size = response['ContentLength']
+                    # Track file size
                     total_bytes_transferred += file_size
                     total_files_processed += 1
                     
-                    parquet_buffer = io.BytesIO(response['Body'].read())
+                    # Read parquet file directly from S3 response
+                    df = pd.read_parquet(io.BytesIO(response['Body'].read()))
+                    logger.info(f"Loaded {len(df)} records from file")
                     
-                    table = pq.read_table(
-                        parquet_buffer,
-                        columns=['utc_timestamp', 'latitude', 'longitude', 'ad_id']
-                    )
+                    if len(df) == 0:
+                        logger.warning(f"Empty dataframe from file: {s3_key}")
+                        continue
                     
-                    file_df = table.to_pandas()
-                    sampled_df = file_df.sample(frac=SAMPLE_RATE)
+                    # For small files (less than 100 records), keep all data
+                    # For larger files, sample based on size
+                    if len(df) < 100:
+                        sampled_df = df
+                        logger.info("Small file, keeping all records")
+                    else:
+                        # Sample rate based on file size
+                        sample_rate = min(1.0, max(0.2, 10000 / len(df)))
+                        sampled_df = df.sample(frac=sample_rate)
+                        logger.info(f"Sampled {len(sampled_df)} records (rate: {sample_rate:.2%})")
+                    
+                    # Add date from folder name
                     sampled_df['folder_date'] = date_folder.split('=')[1]
-                    dfs.append(sampled_df)
+                    
+                    # Filter out invalid coordinates
+                    sampled_df['latitude'] = pd.to_numeric(sampled_df['latitude'], errors='coerce')
+                    sampled_df['longitude'] = pd.to_numeric(sampled_df['longitude'], errors='coerce')
+                    sampled_df = sampled_df.dropna(subset=['latitude', 'longitude'])
+                    
+                    # Filter to Toronto area with more generous bounds
+                    sampled_df = sampled_df[
+                        (sampled_df['latitude'].between(42.5, 44.5)) &  # Extended bounds
+                        (sampled_df['longitude'].between(-80.5, -78.5))  # Extended bounds
+                    ]
+                    
+                    if not sampled_df.empty:
+                        dfs.append(sampled_df)
+                        logger.info(f"Added {len(sampled_df)} records to dataset")
                     
                 except Exception as e:
                     logger.error(f"Error processing file {s3_key}: {e}")
@@ -519,33 +619,54 @@ def load_data_for_range(start_date: datetime, end_date: datetime) -> pd.DataFram
             return pd.DataFrame()
         
         df = pd.concat(dfs, ignore_index=True)
-        logger.info(f"Loaded {len(df)} sampled records")
+        logger.info(f"Loaded {len(df)} total records")
+        
+        # Convert timestamp and extract hour
+        df['timestamp'] = pd.to_datetime(df['utc_timestamp'])
+        df['hour'] = df['timestamp'].dt.hour
+        
+        # Aggregate data by location and hour
+        df['lat_rounded'] = df['latitude'].round(4)  # ~100m resolution
+        df['lon_rounded'] = df['longitude'].round(4)
+        
+        # Group by location and hour, count occurrences
+        df = df.groupby(['lat_rounded', 'lon_rounded', 'hour']).agg({
+            'ad_id': 'count',
+            'latitude': 'first',
+            'longitude': 'first'
+        }).reset_index()
+        
+        # Rename columns
+        df = df.rename(columns={'ad_id': 'count'})
+        
+        logger.info(f"After aggregation: {len(df)} unique locations")
+        
+        # Calculate loading time
+        loading_time = time.time() - start_time
         
         # Store transfer metrics in session state
         st.session_state['data_transfer_metrics'] = {
             'total_bytes': total_bytes_transferred,
             'files_processed': total_files_processed,
             'files_failed': total_files_failed,
-            'formatted_size': format_size(total_bytes_transferred)
+            'formatted_size': format_size(total_bytes_transferred),
+            'loading_time': f"{loading_time:.2f}s",
+            'points_displayed': len(df)
         }
-        
-        # Convert columns
-        df['timestamp'] = pd.to_datetime(df['utc_timestamp'])
-        df['hour'] = df['timestamp'].dt.hour
-        
-        # Convert lat/long to float
-        df['latitude'] = pd.to_numeric(df['latitude'], errors='coerce')
-        df['longitude'] = pd.to_numeric(df['longitude'], errors='coerce')
-        
-        # Drop rows with invalid lat/long
-        df = df.dropna(subset=['latitude', 'longitude'])
-        logger.info(f"After cleaning: {len(df)} valid records")
         
         return df
         
     except Exception as e:
         logger.error(f"Error loading data: {e}")
         return pd.DataFrame()
+
+def update_viewport(view_state: dict):
+    """Update viewport state and trigger data reload"""
+    # Store the new view state in session state
+    st.session_state.viewport_state = view_state
+    
+    # Force a rerun to load new data
+    st.rerun()
 
 def main():
     # Header section with minimalist design
@@ -554,7 +675,7 @@ def main():
     <p style='color: #86868B; font-size: 1.1rem; margin-bottom: 2rem;'>
     Explore movement patterns across the city through beautiful 3D visualizations.
     </p>
-    """, unsafe_allow_html=True)
+    """ + GOOGLE_MAPS_SCRIPT, unsafe_allow_html=True)
     
     # Sidebar with clean design
     with st.sidebar:
@@ -670,70 +791,87 @@ def main():
     start_time = datetime.combine(start_date, datetime.min.time())
     end_time = datetime.combine(end_date, datetime.max.time())
     
-    # Load data for the selected date range
-    df = load_data_for_range(start_time, end_time)
+    # Initialize viewport state if not exists
+    if 'viewport_state' not in st.session_state:
+        st.session_state.viewport_state = {
+            'latitude': DEFAULT_CENTER[0],
+            'longitude': DEFAULT_CENTER[1],
+            'zoom': DEFAULT_ZOOM,
+            'pitch': 50,
+            'bearing': 0
+        }
     
-    if df.empty:
-        st.warning("No data available for the selected time range")
-        return
+    # Create a key for the pydeck chart that includes the viewport state
+    viewport_key = f"viewport_{st.session_state.viewport_state['latitude']}_{st.session_state.viewport_state['longitude']}_{st.session_state.viewport_state['zoom']}"
     
-    # Display data transfer metrics in a modern card
+    # Get current viewport bounds and resolution
+    deck = pdk.Deck(
+        initial_view_state=pdk.ViewState(
+            latitude=st.session_state.viewport_state['latitude'],
+            longitude=st.session_state.viewport_state['longitude'],
+            zoom=st.session_state.viewport_state['zoom'],
+            pitch=st.session_state.viewport_state['pitch'],
+            bearing=st.session_state.viewport_state['bearing']
+        )
+    )
+    
+    viewport_bounds = get_viewport_bounds(deck)
+    resolution = get_resolution_for_zoom(st.session_state.viewport_state['zoom'])
+    
+    # Load data for the entire date range
+    with st.spinner("Loading data..."):
+        df = load_data_for_date_range(
+            start_date=datetime.combine(start_date, datetime.min.time()),
+            end_date=datetime.combine(end_date, datetime.max.time())
+        )
+    
+    # Display metrics
     if 'data_transfer_metrics' in st.session_state:
         metrics = st.session_state['data_transfer_metrics']
-        st.markdown("""
-        <div style='background-color: white; padding: 1.5rem; border-radius: 15px; 
-        box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06);
-        margin-bottom: 2rem;'>
-            <h4 style='color: #1D1D1F; margin-bottom: 1rem;'>Data Transfer Summary</h4>
-        </div>
-        """, unsafe_allow_html=True)
-        
-        metric_cols = st.columns(4)
-        with metric_cols[0]:
-            st.metric("Data Downloaded", metrics['formatted_size'])
-        with metric_cols[1]:
-            st.metric("Files Processed", str(metrics['files_processed']))
-        with metric_cols[2]:
-            st.metric("Files Failed", str(metrics['files_failed']))
-        with metric_cols[3]:
-            success_rate = (metrics['files_processed'] - metrics['files_failed']) / metrics['files_processed'] * 100 if metrics['files_processed'] > 0 else 0
-            st.metric("Success Rate", f"{success_rate:.1f}%")
+        st.info(f"""
+            Data Transfer Metrics:
+            - Size: {metrics['formatted_size']}
+            - Files Processed: {metrics['files_processed']}
+            - Files Failed: {metrics['files_failed']}
+            - Loading Time: {metrics['loading_time']}
+            - Points Displayed: {metrics['points_displayed']}
+        """)
+    
+    if df.empty:
+        st.warning("No data available for the selected date range.")
+        return
     
     # Apply hour filter
     df = df[(df['hour'] >= hour_filter[0]) & (df['hour'] < hour_filter[1])]
     
     if df.empty:
-        st.warning("No data available for the selected hours")
+        st.warning("No data available for the selected hours. Please try a different time period.")
         return
     
     # Create trajectories
     trajectories = create_trajectories(df)
     
-    # Get map center
-    map_center = [df['latitude'].mean(), df['longitude'].mean()]
-    
     # Create visualization based on selection
     viz_container = st.container()
     with viz_container:
-        # Map container with subtle shadow and rounded corners
         st.markdown("""
         <div style='background-color: white; padding: 1rem; border-radius: 20px; 
         box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06);'>
         """, unsafe_allow_html=True)
         
+        # Create visualization based on selection
         if viz_type == "Arc Map" and not trajectories.empty:
             st.markdown(f"<h3 style='color: #1D1D1F; margin-bottom: 1rem;'>Movement Flows</h3>", unsafe_allow_html=True)
-            # Arc map showing mobility flows
             layer = create_arc_layer(trajectories)
             
             deck = pdk.Deck(
-                map_style="mapbox://styles/mapbox/light-v10",  # Light theme for Apple-like aesthetic
+                map_style=MAP_STYLE,
                 initial_view_state=pdk.ViewState(
-                    latitude=map_center[0],
-                    longitude=map_center[1],
-                    zoom=11,
+                    latitude=DEFAULT_CENTER[0],
+                    longitude=DEFAULT_CENTER[1],
+                    zoom=DEFAULT_ZOOM,
                     pitch=50,
-                    bearing=0,
+                    bearing=0
                 ),
                 layers=[layer],
                 tooltip={"text": "Start: {start_lat}, {start_lon}\nEnd: {end_lat}, {end_lon}"}
@@ -747,13 +885,12 @@ def main():
             with stats_col1:
                 st.metric("Total Flows", f"{len(trajectories):,}")
             with stats_col2:
-                st.metric("Unique Users", f"{trajectories['user_id'].nunique():,}")
+                st.metric("Total Count", f"{trajectories['count'].sum():,}")
             with stats_col3:
-                st.metric("Avg Distance", f"{trajectories['dist'].mean():.2f} km")
+                st.metric("Avg Count", f"{trajectories['count'].mean():.1f}")
         
         elif viz_type == "Flow Map" and not trajectories.empty:
             st.markdown(f"<h3 style='color: #1D1D1F; margin-bottom: 1rem;'>Real-time Movement</h3>", unsafe_allow_html=True)
-            # Prepare flow data
             flow_data = prepare_flow_data(trajectories)
             
             layer = pdk.Layer(
@@ -767,69 +904,49 @@ def main():
                 current_time=0
             )
             
-            view_state = pdk.ViewState(
-                latitude=map_center[0],
-                longitude=map_center[1],
-                zoom=11,
-                pitch=45,
-                bearing=0
-            )
-            
-            # Create and display deck
-            r = pdk.Deck(
+            deck = pdk.Deck(
                 layers=[layer],
-                initial_view_state=view_state,
-                map_style="mapbox://styles/mapbox/dark-v10",
+                initial_view_state=pdk.ViewState(
+                    latitude=DEFAULT_CENTER[0],
+                    longitude=DEFAULT_CENTER[1],
+                    zoom=DEFAULT_ZOOM,
+                    pitch=50,
+                    bearing=0
+                ),
+                map_style=MAP_STYLE
             )
             
-            st.pydeck_chart(r, use_container_width=True, height=800)
-            
-            # Show time lapse animation control
-            st.subheader("Time Lapse Animation")
-            time_anim = st.empty()
-            play_button = st.button("Play Animation")
-            
-            if play_button:
-                for i in range(100):
-                    # Update the current_time attribute of the layer
-                    layer.current_time = i / 10
-                    
-                    # Update the deck with the new layer
-                    r.layers = [layer]
-                    
-                    # Render the updated deck
-                    time_anim.pydeck_chart(r, use_container_width=True, height=800)
-                    time.sleep(0.1)
+            st.pydeck_chart(deck, use_container_width=True, height=800)
         
         elif viz_type == "Hexagon Map":
             st.markdown(f"<h3 style='color: #1D1D1F; margin-bottom: 1rem;'>Population Density</h3>", unsafe_allow_html=True)
-            # 3D Hexbin map
             layer = pdk.Layer(
                 "HexagonLayer",
                 data=df,
                 get_position=["longitude", "latitude"],
+                get_weight="count",
                 radius=100,
                 elevation_scale=elevation_scale,
                 elevation_range=[0, 1000],
                 extruded=True,
                 pickable=True,
                 auto_highlight=True,
-                colorRange=[[0, 255, 0, 160],  # Green for low density
+                colorRange=[[0, 255, 0, 160],
                            [128, 255, 0, 160],
                            [255, 255, 0, 160],
                            [255, 128, 0, 160],
-                           [255, 0, 0, 160]],  # Red for high density
+                           [255, 0, 0, 160]],
                 colorAggregation='SUM'
             )
             
             deck = pdk.Deck(
-                map_style="mapbox://styles/mapbox/dark-v10",
+                map_style=MAP_STYLE,
                 initial_view_state=pdk.ViewState(
-                    latitude=map_center[0],
-                    longitude=map_center[1],
-                    zoom=11,
+                    latitude=DEFAULT_CENTER[0],
+                    longitude=DEFAULT_CENTER[1],
+                    zoom=DEFAULT_ZOOM,
                     pitch=50,
-                    bearing=0,
+                    bearing=0
                 ),
                 layers=[layer],
                 tooltip={"text": "Count: {elevationValue}"}
@@ -839,11 +956,11 @@ def main():
         
         elif viz_type == "Grid Map":
             st.markdown(f"<h3 style='color: #1D1D1F; margin-bottom: 1rem;'>Activity Zones</h3>", unsafe_allow_html=True)
-            # 3D Grid map
             layer = pdk.Layer(
                 "GridLayer",
                 data=df,
                 get_position=["longitude", "latitude"],
+                get_weight="count",
                 cell_size=200,
                 elevation_scale=elevation_scale,
                 pickable=True,
@@ -851,13 +968,13 @@ def main():
             )
             
             deck = pdk.Deck(
-                map_style="mapbox://styles/mapbox/dark-v10",
+                map_style=MAP_STYLE,
                 initial_view_state=pdk.ViewState(
-                    latitude=map_center[0],
-                    longitude=map_center[1],
-                    zoom=11,
+                    latitude=DEFAULT_CENTER[0],
+                    longitude=DEFAULT_CENTER[1],
+                    zoom=DEFAULT_ZOOM,
                     pitch=50,
-                    bearing=0,
+                    bearing=0
                 ),
                 layers=[layer],
                 tooltip={"text": "Count: {count}"}
@@ -867,24 +984,23 @@ def main():
         
         else:  # Point Map
             st.markdown(f"<h3 style='color: #1D1D1F; margin-bottom: 1rem;'>Location Points</h3>", unsafe_allow_html=True)
-            # Simple scatterplot
             layer = pdk.Layer(
                 "ScatterplotLayer",
                 data=df,
                 get_position=["longitude", "latitude"],
-                get_color=[255, 0, 0, 160],
-                get_radius=50,
+                get_fill_color=[255, 0, 0, 160],
+                get_radius="count * 50",
                 pickable=True,
             )
             
             deck = pdk.Deck(
-                map_style="mapbox://styles/mapbox/dark-v10",
+                map_style=MAP_STYLE,
                 initial_view_state=pdk.ViewState(
-                    latitude=map_center[0],
-                    longitude=map_center[1],
-                    zoom=11,
+                    latitude=DEFAULT_CENTER[0],
+                    longitude=DEFAULT_CENTER[1],
+                    zoom=DEFAULT_ZOOM,
                     pitch=50,
-                    bearing=0,
+                    bearing=0
                 ),
                 layers=[layer],
                 tooltip={"text": "Lat: {latitude}, Lon: {longitude}"}
@@ -894,84 +1010,29 @@ def main():
         
         st.markdown("</div>", unsafe_allow_html=True)
     
-    # Data insights section
-    st.markdown("<div style='height: 3rem'></div>", unsafe_allow_html=True)
-    st.markdown("""
-    <h3 style='color: #1D1D1F; margin-bottom: 1.5rem;'>Data Insights</h3>
-    """, unsafe_allow_html=True)
-    
-    # Modern metrics display
-    metrics_col1, metrics_col2, metrics_col3, metrics_col4 = st.columns(4)
-    with metrics_col1:
-        st.metric(
-            "Total Records",
-            f"{len(df):,}",
-            delta=f"{len(df) - len(df[df['hour'] < 12]):,} in PM"
-        )
-    with metrics_col2:
-        st.metric(
-            "Unique Users",
-            f"{df['ad_id'].nunique():,}"
-        )
-    with metrics_col3:
-        st.metric(
-            "Peak Hour",
-            f"{df.groupby('hour').size().idxmax():02d}:00",
-            delta="Most Active"
-        )
-    with metrics_col4:
-        st.metric(
-            "Date Range",
-            f"{(end_date - start_date).days + 1} Days",
-            delta=f"{start_date.strftime('%b %d')} - {end_date.strftime('%b %d')}"
-        )
-    
-    # Activity chart with modern styling
-    st.markdown("<div style='height: 2rem'></div>", unsafe_allow_html=True)
-    st.markdown("""
-    <h4 style='color: #1D1D1F; margin-bottom: 1rem;'>24-Hour Activity Pattern</h4>
-    """, unsafe_allow_html=True)
-    
-    hour_counts = df.groupby('hour').size().reset_index()
-    hour_counts.columns = ['Hour', 'Count']
-    
-    # Format hours in 12-hour format with AM/PM
-    hour_counts['Hour_Format'] = hour_counts['Hour'].apply(
-        lambda x: f"{x if x < 12 else x-12 if x > 12 else 12} {'AM' if x < 12 else 'PM'}"
-    )
-    
-    st.bar_chart(
-        hour_counts.set_index('Hour_Format')['Count'],
-        use_container_width=True,
-        height=400
-    )
-
-    # Add client-side data loading JavaScript
+    # Add JavaScript to handle viewport changes
     st.markdown("""
     <script>
-    async function loadDataFromUrls(urls) {
-        const allData = [];
-        for (const url of urls) {
-            try {
-                const response = await fetch(url.url);
-                const data = await response.json();
-                allData.push(...data);
-            } catch (error) {
-                console.error('Error loading data:', error);
-            }
+    // Listen for viewport changes from pydeck
+    window.addEventListener('message', (event) => {
+        if (event.data.type === 'pydeck_view_state_change') {
+            const viewState = event.data.viewState;
+            
+            // Send the viewport state to Streamlit
+            window.parent.postMessage({
+                type: 'streamlit:setComponentValue',
+                value: {
+                    viewport: {
+                        latitude: viewState.latitude,
+                        longitude: viewState.longitude,
+                        zoom: viewState.zoom,
+                        pitch: viewState.pitch,
+                        bearing: viewState.bearing
+                    }
+                }
+            }, '*');
         }
-        return allData;
-    }
-
-    // Load data when the page loads
-    if (window.dataUrls) {
-        loadDataFromUrls(window.dataUrls).then(data => {
-            // Process the data and update the visualization
-            window.mobilityData = data;
-            // Trigger visualization update
-            window.dispatchEvent(new CustomEvent('dataLoaded'));
-        });
-    }
+    });
     </script>
     """, unsafe_allow_html=True)
 
